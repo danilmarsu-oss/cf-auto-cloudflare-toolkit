@@ -39,6 +39,12 @@ python3 cf_bulk_add_zones.py --domains-file domains.txt
 python3 cf_bulk_add_zones.py --domains-file domains.txt --account-id <CLOUDFLARE_ACCOUNT_ID>
 ```
 
+Для м’якого обходу тимчасового rate limit (`HTTP 429: Please wait and consider throttling your request speed`):
+
+```bash
+python3 cf_bulk_add_zones.py --domains-file domains.txt --delay 1.0 --max-retries 8 --retry-base-delay 1.5
+```
+
 Якщо в системі є проблеми з TLS-сертифікатами, можна вказати свій CA bundle:
 
 ```bash
@@ -64,6 +70,11 @@ python3 cf_bulk_add_zones.py --domains-file domains.txt --insecure
 - `status` (`created` / `existing` / `error`)
 - `ns1`, `ns2`
 - `message`
+
+Примітка по 429:
+
+- `Please wait and consider throttling your request speed` = тимчасовий rate limit (скрипт тепер робить автоповтори).
+- `You have exceeded the limit for adding zones. Please activate some zones.` = квота акаунта, ретраї не допоможуть (треба активувати зони/зняти ліміт).
 
 ## Web інтерфейс (зручний режим)
 

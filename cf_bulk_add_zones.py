@@ -25,6 +25,38 @@ class CloudflareAPIError(Exception):
         self.errors = errors or []
 
 
+def _is_zone_quota_error(message: str) -> bool:
+    msg = message.lower()
+    return "exceeded the limit for adding zones" in msg
+
+
+def _is_retryable_throttle_message(message: str) -> bool:
+    msg = message.lower()
+    if _is_zone_quota_error(msg):
+        return False
+    return (
+        "please wait and consider throttling your request speed" in msg
+        or "rate limit" in msg
+        or "too many requests" in msg
+    )
+
+
+def _extract_retry_after_seconds(header_value: str | None) -> float | None:
+    if not header_value:
+        return None
+    try:
+        seconds = float(header_value.strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _compute_backoff(attempt: int, base: float, max_backoff: float = 20.0) -> float:
+    # Exponential backoff: base, 2*base, 4*base...
+    delay = base * (2 ** max(0, attempt - 1))
+    return min(delay, max_backoff)
+
+
 def build_ssl_context(insecure: bool = False, ca_bundle: str | None = None) -> ssl.SSLContext:
     if insecure:
         return ssl._create_unverified_context()  # noqa: SLF001
@@ -70,6 +102,8 @@ def _api_request(
     ssl_context: ssl.SSLContext,
     payload: dict[str, Any] | None = None,
     query: dict[str, Any] | None = None,
+    max_retries: int = 5,
+    retry_base_delay: float = 1.0,
 ) -> dict[str, Any]:
     url = f"{API_BASE}{path}"
     if query:
@@ -84,36 +118,66 @@ def _api_request(
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
 
-    req = urllib.request.Request(url=url, data=data, method=method, headers=headers)
+    for attempt in range(1, max_retries + 2):
+        req = urllib.request.Request(url=url, data=data, method=method, headers=headers)
 
-    try:
-        with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace") if e.fp else ""
         try:
-            parsed = json.loads(body) if body else {}
-        except json.JSONDecodeError:
-            parsed = {}
+            with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
+                raw = resp.read().decode("utf-8")
+                parsed = json.loads(raw)
 
-        errors = parsed.get("errors", []) if isinstance(parsed, dict) else []
-        detail = "; ".join(str(err.get("message", err)) for err in errors) if errors else body or str(e)
-        raise CloudflareAPIError(
-            f"HTTP {e.code}: {detail}",
-            status_code=e.code,
-            errors=errors,
-        ) from e
-    except urllib.error.URLError as e:
-        raise CloudflareAPIError(f"Network error: {e}") from e
+                # Cloudflare can return throttling as success=false JSON payload.
+                if isinstance(parsed, dict) and not parsed.get("success", True):
+                    errors = parsed.get("errors", []) if isinstance(parsed.get("errors"), list) else []
+                    detail = "; ".join(str(err.get("message", err)) for err in errors)
+                    if _is_retryable_throttle_message(detail) and attempt <= max_retries:
+                        time.sleep(_compute_backoff(attempt, retry_base_delay))
+                        continue
+
+                return parsed
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+            try:
+                parsed = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                parsed = {}
+
+            errors = parsed.get("errors", []) if isinstance(parsed, dict) else []
+            detail = "; ".join(str(err.get("message", err)) for err in errors) if errors else body or str(e)
+
+            retryable_http_429 = e.code == 429 and _is_retryable_throttle_message(detail)
+            if retryable_http_429 and attempt <= max_retries:
+                retry_after = _extract_retry_after_seconds(e.headers.get("Retry-After"))
+                wait_seconds = retry_after if retry_after is not None else _compute_backoff(attempt, retry_base_delay)
+                time.sleep(wait_seconds)
+                continue
+
+            raise CloudflareAPIError(
+                f"HTTP {e.code}: {detail}",
+                status_code=e.code,
+                errors=errors,
+            ) from e
+        except urllib.error.URLError as e:
+            raise CloudflareAPIError(f"Network error: {e}") from e
+
+    raise CloudflareAPIError("Unexpected retry loop termination")
 
 
-def list_zone_by_name(token: str, domain: str, ssl_context: ssl.SSLContext) -> dict[str, Any] | None:
+def list_zone_by_name(
+    token: str,
+    domain: str,
+    ssl_context: ssl.SSLContext,
+    *,
+    max_retries: int = 5,
+    retry_base_delay: float = 1.0,
+) -> dict[str, Any] | None:
     response = _api_request(
         token,
         "GET",
         "/zones",
         ssl_context=ssl_context,
+        max_retries=max_retries,
+        retry_base_delay=retry_base_delay,
         query={"name": domain, "per_page": 1, "match": "all"},
     )
 
@@ -126,12 +190,20 @@ def list_zone_by_name(token: str, domain: str, ssl_context: ssl.SSLContext) -> d
     return result[0] if result else None
 
 
-def get_first_account_id(token: str, ssl_context: ssl.SSLContext) -> str | None:
+def get_first_account_id(
+    token: str,
+    ssl_context: ssl.SSLContext,
+    *,
+    max_retries: int = 5,
+    retry_base_delay: float = 1.0,
+) -> str | None:
     response = _api_request(
         token,
         "GET",
         "/accounts",
         ssl_context=ssl_context,
+        max_retries=max_retries,
+        retry_base_delay=retry_base_delay,
         query={"per_page": 1, "page": 1},
     )
 
@@ -145,7 +217,15 @@ def get_first_account_id(token: str, ssl_context: ssl.SSLContext) -> str | None:
     return result[0].get("id")
 
 
-def create_zone(token: str, domain: str, account_id: str | None, ssl_context: ssl.SSLContext) -> tuple[str, dict[str, Any], str]:
+def create_zone(
+    token: str,
+    domain: str,
+    account_id: str | None,
+    ssl_context: ssl.SSLContext,
+    *,
+    max_retries: int = 5,
+    retry_base_delay: float = 1.0,
+) -> tuple[str, dict[str, Any], str]:
     payload: dict[str, Any] = {
         "name": domain,
         "type": "full",
@@ -154,7 +234,15 @@ def create_zone(token: str, domain: str, account_id: str | None, ssl_context: ss
         payload["account"] = {"id": account_id}
 
     try:
-        response = _api_request(token, "POST", "/zones", ssl_context=ssl_context, payload=payload)
+        response = _api_request(
+            token,
+            "POST",
+            "/zones",
+            ssl_context=ssl_context,
+            payload=payload,
+            max_retries=max_retries,
+            retry_base_delay=retry_base_delay,
+        )
     except CloudflareAPIError as e:
         message = str(e).lower()
         already_exists = any(
@@ -163,7 +251,13 @@ def create_zone(token: str, domain: str, account_id: str | None, ssl_context: ss
         ) or ("already" in message and "exists" in message)
 
         if already_exists:
-            zone = list_zone_by_name(token, domain, ssl_context)
+            zone = list_zone_by_name(
+                token,
+                domain,
+                ssl_context,
+                max_retries=max_retries,
+                retry_base_delay=retry_base_delay,
+            )
             if zone:
                 return "existing", zone, "Zone already exists in account"
             return "error", {}, "Zone already exists, but failed to read existing zone"
@@ -229,6 +323,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delay", type=float, default=0.2, help="Delay between requests in seconds")
     parser.add_argument("--ca-bundle", help="Custom CA bundle path (PEM)")
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification (not recommended)")
+    parser.add_argument("--max-retries", type=int, default=5, help="Max retries for temporary 429 throttling")
+    parser.add_argument("--retry-base-delay", type=float, default=1.0, help="Base retry delay for 429 (seconds)")
     return parser.parse_args()
 
 
@@ -248,7 +344,12 @@ def main() -> int:
     ssl_context = build_ssl_context(args.insecure, args.ca_bundle)
     account_id = args.account_id
     if not account_id:
-        account_id = get_first_account_id(token, ssl_context)
+        account_id = get_first_account_id(
+            token,
+            ssl_context,
+            max_retries=args.max_retries,
+            retry_base_delay=args.retry_base_delay,
+        )
         if account_id:
             print(f"Using auto-detected account_id: {account_id}")
         else:
@@ -259,7 +360,14 @@ def main() -> int:
     print(f"Processing {len(domains)} domains...")
 
     for i, domain in enumerate(domains, start=1):
-        status, zone, message = create_zone(token, domain, account_id, ssl_context)
+        status, zone, message = create_zone(
+            token,
+            domain,
+            account_id,
+            ssl_context,
+            max_retries=args.max_retries,
+            retry_base_delay=args.retry_base_delay,
+        )
         name_servers = zone.get("name_servers") or []
         row = {
             "domain": domain,
