@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# runtime artifacts
+*.log
+*.pid
+
+# generated data/results
+cloudflare_ns_*.csv
+cloudflare_ns_*.json
+zones_page1.json
+one_domain.txt
+domains.txt
+failed_domains*.txt
+
+# local environment
+.venv/
+.env
